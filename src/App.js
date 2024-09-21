@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
-import { collection, addDoc, query, onSnapshot, orderBy } from "firebase/firestore";
+import { collection, addDoc, query, onSnapshot, orderBy, setDoc, doc, getDoc, updateDoc } from "firebase/firestore";
 import { db } from "./firebaseConfig";
 import './App.css';
 
@@ -14,6 +14,15 @@ function App() {
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState([]);
   const [isVoiceChatOn, setIsVoiceChatOn] = useState(false);
+  const [callId, setCallId] = useState("");
+  
+  const servers = {
+    iceServers: [
+      {
+        urls: "stun:stun.l.google.com:19302", // GoogleのSTUNサーバーを使用
+      }
+    ]
+  }
 
   // チャットスクロール制御
   const scrollToBottom = () => {
@@ -46,28 +55,122 @@ function App() {
     }
   };
 
-  // ボイチャ開始
+  // ボイチャ開始（オファー側）
   const startVoiceChat = async () => {
     try {
+      // Firestoreにドキュメント作成（シグナリング用）
+      const callDoc = await addDoc(collection(db, "calls"), {});
+      setCallId(callDoc.id); // callIdを保存
+      const offerCandidates = collection(callDoc, "offerCandidates");
+      const answerCandidates = collection(callDoc, "answerCandidates");
+
       // オーディオローカルストリーム取得
       const localStream = 
         await navigator.mediaDevices.getUserMedia({ audio: true });
       localAudioRef.current.srcObject = localStream;
       localStreamRef.current = localStream;
 
-      // WebRTCピアコネクションの作成
-      const peerConnection = new RTCPeerConnection();
+      // WebRTCピアコネクションの作成（STUNサーバー追加）
+      const peerConnection = new RTCPeerConnection(servers);
       localStream.getTracks().forEach((track) => peerConnection.addTrack(track, localStream));
 
-      peerConnection.current.srcObject = (event) => {
+      peerConnection.onicecandidate = (event) => {
+        if (event.candidate) {
+          addDoc(offerCandidates, event.candidate.toJSON());
+        }
+      };
+
+      peerConnection.ontrack = (event) => {
         // リモートオーディオを受信
-        remoteAudioRef.current.srcObject = event.streams[0];
-      }
+        if (remoteAudioRef.current) {
+          remoteAudioRef.current.srcObject = event.streams[0];
+        }
+      };
+
+      // オファーを作成してFirestoreに保存
+      const offerDescription = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offerDescription);
+      await setDoc(callDoc, { offer: offerDescription });
+
+      // Firestoreからアンサーを監視
+      onSnapshot(callDoc, (snapshot) => {
+        const data = snapshot.data();
+        if (!peerConnection.currentRemoteDescription && data?.answer) {
+          const answerDescription = new RTCSessionDescription(data.answer);
+          peerConnection.setRemoteDescription(answerDescription);
+        }
+      });
+
+      // ICE候補のリスナー
+      onSnapshot(answerCandidates, (snapshot) => {
+        snapshot.docChanges().forEach((change) => {
+          if (change.type === "added") {
+            const candidate = new RTCIceCandidate(change.doc.data());
+            peerConnection.addIceCandidate(candidate);
+          }
+        });
+      });
+
       peerConnectionRef.current = peerConnection;
       setIsVoiceChatOn(true);
 
     } catch (error) {
       console.error("Error starting voice chat: ", error);
+    }
+  };
+
+  // ボイチャに参加（アンサー側）
+  const joinVoiceChat = async (callId) => {
+    try {
+      const callDoc = doc(db, "calls", callId);
+      const offerCandidates = collection(callDoc, "offerCandidates");
+      const answerCandidates = collection(callDoc, "answerCandidates");
+
+      // オーディオローカルストリーム取得
+      const localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      localAudioRef.current.srcObject = localStream;
+      localStreamRef.current = localStream;
+
+      // WebRTCピアコネクションの作成
+      const peerConnection = new RTCPeerConnection(servers);
+      localStream.getTracks().forEach((track) => peerConnection.addTrack(track, localStream));
+
+      peerConnection.onicecandidate = (event) => {
+        if (event.candidate) {
+          addDoc(answerCandidates, event.candidate.toJSON());
+        }
+      };
+
+      peerConnection.ontrack = (event) => {
+        remoteAudioRef.current.srcObject = event.streams[0];
+      };
+
+      // Firestore からオファーを取得
+      const callData = (await getDoc(callDoc)).data();
+      const offerDescription = callData.offer;
+      await peerConnection.setRemoteDescription(new RTCSessionDescription(offerDescription));
+
+      // アンサーを作成して Firestore に保存
+      const answerDescription = await peerConnection.createAnswer();
+      await peerConnection.setLocalDescription(answerDescription);
+      await updateDoc(callDoc, { answer: answerDescription });
+
+      // ICE候補のリスナー
+      onSnapshot(offerCandidates, (snapshot) => {
+        snapshot.docChanges().forEach((change) => {
+          if (change.type === "added") {
+            const candidate = new RTCIceCandidate(change.doc.data());
+            peerConnection.addIceCandidate(candidate);
+          }
+        });
+      });
+
+      peerConnectionRef.current = peerConnection;
+      setIsVoiceChatOn(true);
+
+
+    } catch (error) {
+      console.error("Error joining voice chat: ", error);
     }
   };
 
@@ -78,7 +181,7 @@ function App() {
     }
 
     if (peerConnectionRef.current) {
-      peerConnectionRef.current.stop();
+      peerConnectionRef.current.close();
     }
     setIsVoiceChatOn(false);
   }
@@ -110,15 +213,21 @@ function App() {
       {/* ボイスチャット機能 */}
       <div className="voice-chat-container">
         <h2>ボイスチャット</h2>
+        <audio ref={localAudioRef} autoPlay muted />
+        <audio ref={remoteAudioRef} autoPlay />
         {isVoiceChatOn ? (
-          <div>
-            <audio ref={localAudioRef} autoPlay muted />
-            <audio ref={remoteAudioRef} autoPlay />
-            <button onClick={stopVoiceChat}>Stop VC</button>
-          </div>
+          <button onClick={stopVoiceChat}>Stop VC</button>
         ) : (
           <button onClick={startVoiceChat}>Start VC</button>
         )}
+        {/* 参加用のUI */}
+        <input
+          type="text"
+          value={callId}
+          onChange={(e) => setCallId(e.target.value)}
+          placeholder="Enter Call ID to Join"
+        />
+        <button onClick={() => joinVoiceChat(callId)}>Join VC</button>
       </div>
     </div>
 
